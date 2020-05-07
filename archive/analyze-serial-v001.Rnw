@@ -1,0 +1,1518 @@
+\documentclass{article}
+\usepackage{savetrees}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+<<loadLibraries, echo=FALSE, message=FALSE,warning=FALSE>>=
+library(clue)     
+library(gplots)
+library(signal)
+library(calibrate)
+library(caTools)
+library(xtable)
+library(robustbase)
+library(MASS)
+library(bmp)
+library(tools)
+library(imager)
+library(xlsx)
+@
+
+<<setup>>=
+date()
+#enter metadata for the experiment 
+mouse_id <- "NSG147"      ###########------- moyuuse number_compartment "BM", Bone marrow; "BM", Spleen "PB", peripheral blood
+treatment_id <- "treated_MRD" ###########------- either "pretreatment", "treated", "treated_MRD", "relapse"
+directory = "C:/Users/Mahnoor/Dropbox (MIT)/B-ALL PDX Linked Data/Raw data/200211_GL/"
+#set frequency order depending on the machine used
+# reorder - from frequency-based ordering to spatial ordering
+#o=c(12,10,9,11,8,7,1,2,3,4,5,6) #new chip on trap2 as of 03/26/18 with 4th cantileiver dropped chip#P10_F14_701
+#o=c(12,11,10,9,8,7,6,5,4,3,2,1)#for old greenline 2017-19
+o=c(12,11,10,9,8,7,1,2,3,4,5,6)#for Greenline mid 2019-2020
+#o=c(7,8,9,10,11,12,6,5,4,3,2,1)#lyla2
+#o=c(1,2,3,4,5,6,7,8,9,10,11,12)#lyla's after move
+
+# input data parameters
+#directory =  "D:/Dropbox (MIT)/Nick SMR Data/Greenline/2018 - Greenline/180608_MMLprimary_greenline/"
+imageDirectory = "Z:/pswinter/B-ALL SMR/Raw data/180410 - AML Spleen/180410 - AML Spleen coefs .xlsx/"
+#outgrowtfile, set = NA if not in use
+outgrowthfile = NA
+  #"D:/Dropbox (MIT)/Nick SMR Data/Greenline/2017 - Greenline/170216 - BT360 collection/170217 - BT360 outgrowth.xlsx" 
+
+sampleName = mouse_id
+dataRate = 500 # Hz
+minCarrier = 640e3 # Hz
+minSensitivityEstimate = .52 # Hz/pg
+ 
+# file processing parameters
+experimentTimeWindow = c(0/60,12) # hr - start and end of experiment/analysis. Set end way too big to use whole file.
+padTrimmedData<- TRUE # Whether to pad the trimmed data so the file length aligns with metadata
+
+# 1= mode calibration, 2= linear time-sensitivity model calibration, 3 = linear carrier-sensitivity model calibration, 4= import bead sensitivity file
+
+beadcalibtype <-1
+# sensitivityfile<-"D:/Dropbox (MIT)/Nick SMR Data/fSMR/180321 - 20x test/Mode-sensitivities_fromP130.csv"
+#Bead detection mode, 1= time&mass, 2= mass only
+beadDetect<-1
+beadTimeWindow<-c(0,3)
+cellTimeWindow<-c(3,12)
+
+# detection parameters
+detectionThreshold = -3
+tDoubletGap = c(50,1000)
+maxHeightDiff = .5
+medLength = 7;
+sgLength = 51;
+sgOrder = 3;
+quantileWidth=500
+quantileDownsamplingFactor=21;
+quantileProb = .95
+baselineSearchWidthSidePoints = 600; # 0.8 seconds on either side
+numBaselineChunks = 20; 
+tipSidePointFractionOfPeakWidth = 0.15
+
+# outlier rejection parameters
+outlierDetectionThreshold= -2000  # log of probability cutoff - set to NA to not use.
+outlierDetectionThresholdBead= -2000
+#Node deviation removal for bead doublet/triplets - set to -1 to not use
+ndevpermasscutoff<- -.2
+
+# plotting parameters
+plotDec = 20
+
+# calibration parameters
+mediaDensity = 1.003;       # g/mL (RPMI+10%FBS is 1.003g/mL, ballparked YPD = 1.01)
+calibrationBounds = c(7.5,9.5)
+calibrationBeadDiameter = 6.98 # um
+calibrationBeadCV = 0.01 #CV in decimal, ie .01=1%
+densityBandwidth = .1
+beadMaterialDensity<- 1.05
+
+# matching parameters
+cellSizeRange    = c(7,100) #pg
+sensorsToDrop    = NULL # set to NULL to not drop any
+mass.sd          = 0.25
+gr.mu.prior      = 0
+gr.sd.prior      = 10
+timeGap.mu       = 1.6/60
+timeGap.sd       = .7/60
+gapCost          = 1
+trapLengthCutoff = 6
+
+
+# link to images - set imageDirectory to NULL to skip. make sure slash is on the end!
+matchimages<-TRUE
+imageLocation = 1; # which cantilever outlet were we imaging at?
+
+
+# Number of single cell trajectories to plot
+numSingleTraj = 1
+
+#Number of standard deviations above the mean MAR error to prune out
+sdtoprune = 3
+
+@
+
+<<tables, echo=FALSE,results='asis',warning=FALSE>>=
+# Reads settings tables
+ExperimentInfo <- list.files(directory,full.names=TRUE, pattern="Experiment Info.csv")
+ExperimentInfo <- read.csv(ExperimentInfo,head=FALSE,sep=",")
+
+SMRSettings <- list.files(directory,full.names=TRUE, pattern="SMR Driver Settings.csv")
+SMRSettings <- read.csv(SMRSettings,head=FALSE,sep=",")
+SMRSettings <-t(SMRSettings)
+
+SMRSettingsTrim <- rbind(SMRSettings[13,],SMRSettings[7,],SMRSettings[12,],SMRSettings[16,],SMRSettings[18,],SMRSettings[19,],SMRSettings[22,],SMRSettings[23,])
+rownames(SMRSettingsTrim) <-SMRSettingsTrim[,1]
+SMRSettingsTrim<-SMRSettingsTrim[,-1]
+SMRSettingsTrim<-t(SMRSettingsTrim)
+
+xtable(ExperimentInfo[1:11,],caption='Experiment Info')
+xtable(ExperimentInfo[12:16,],caption='Primary Cell  Info')
+xtable(ExperimentInfo[17:20,],caption='Drug Dosage Info')
+xtable(SMRSettingsTrim,caption='SMR Driver Settings')
+
+@
+
+<<generalSetup, echo=FALSE,results='hide'>>=
+
+files = list.files(directory,full.names=TRUE, pattern="*.bin")
+files = files[o]
+
+
+set.seed(1)
+"%+%" <- function(x,y) paste(x,y,sep="")
+"%within%" <- function(x,y) (x >= y[1] & x <= y[2])
+n = length(files)+1
+cols = rgb(0:n/n,c(1:(n/2)/(n/2),(n/2):1/(n/2)),n:0/n)
+cols[1] = 'black'
+cols[sensorsToDrop] = '#00000000'
+sensorsToKeep = which( !(1:length(files) %in% sensorsToDrop))
+
+@
+
+\newpage
+
+<<loadData, echo=FALSE,results='hide'>>=
+
+dat.decimated = list() # we'll keep this around for plotting purposes
+dat.bp.decimated = list() # we'll keep this around for plotting purposes
+detectedPeaks = list()
+
+
+
+getPeaks = function(freqData_bandPassFiltered, rawData, detectionThreshold, 
+                    tDoubletGap,  maxHeightDiff, baselineSearchWidthSidePoints, numBaselineChunks,
+			  tipSidePointFractionOfPeakWidth, visualizeNum=5) {
+	freqTime = (1:length(freqData_bandPassFiltered))/dataRate # seconds
+
+	# DETECTION AND ESTIMATION
+	# use a threshold and a bunch of vector-based functions to find contiguous data segments below the threshold.
+	# these are how we define peaks. 
+	
+	findIndicesBelowThreshold = function(x, t) which(x<t, arr.ind=T)
+	indicesBelowThreshold = findIndicesBelowThreshold(freqData_bandPassFiltered, t=detectionThreshold)
+	
+	findPeakStartIndices = function(i) i[c(1, which(diff(i)> 1, arr.ind=T)+1)]
+	peakStartIndices = findPeakStartIndices(indicesBelowThreshold)
+	
+	findPeakEndIndices = function(i) i[c(which(diff(i)> 1, arr.ind=T), length(i))]
+	peakEndIndices = findPeakEndIndices(indicesBelowThreshold)
+	peakWidth_indices = peakEndIndices - peakStartIndices
+	
+	minimumWithinRange = function(i1, i2, x) min(x[min(i1,i2):max(i1,i2)])
+	findPeakHeights = function(i1, i2, x) mapply(minimumWithinRange, i1, i2, MoreArgs=list(x=x))
+	peakHeights = findPeakHeights(peakStartIndices, peakEndIndices, freqData_bandPassFiltered)
+	
+	which.minWithinRange = function(i1, i2, x) which.min(x[min(i1,i2):max(i1,i2)])+min(i1,i2)-1
+	findPeakCenters = function(i1, i2, x) mapply(which.minWithinRange, i1, i2, MoreArgs=list(x=x))
+	peakCenters = findPeakCenters(peakStartIndices, peakEndIndices, freqData_bandPassFiltered)	
+	
+	## Sometimes when the cell passes the node, the signal won't return to baseline.
+	## We need to detect those cases (detected as a single peak) and split them into two peaks.
+	toInsert = list()
+	j=1
+	for (i in 1:length(peakHeights)){
+		#threshold at half peak height
+		indicesBelowThreshold = which(freqData_bandPassFiltered[peakStartIndices[i]:peakEndIndices[i]] < 0.85*peakHeights[i])
+		newPeakEndIndices = indicesBelowThreshold[which(diff(indicesBelowThreshold) > tDoubletGap[1])]
+
+		#if no discontinuities, continue
+		if(length(newPeakEndIndices) != 1) next
+
+		newPeakStartIndices = indicesBelowThreshold[which(diff(indicesBelowThreshold) > tDoubletGap[1],arr.ind=T)+1]
+		toInsert[[j]] = c(i, peakStartIndices[i]+newPeakStartIndices, peakStartIndices[i]+newPeakEndIndices)
+		j=j+1
+	}
+
+	# insert one at at time from end to ensure we don't mess up indexing
+	for (ins in rev(toInsert)){ 
+		if (ins[1]==length(peakStartIndices)){ 
+			peakStartIndices = c(peakStartIndices,ins[2])
+		} else {
+			peakStartIndices = c(peakStartIndices[1:ins[1]],ins[2], peakStartIndices[(ins[1]+1):length(peakStartIndices)])
+		}
+		if (ins[1]==1) {
+			peakEndIndices =   c(ins[3], peakEndIndices)
+		} else {
+			peakEndIndices =   c(peakEndIndices[1:(ins[1]-1)], ins[3], peakEndIndices[ins[1]:length(peakEndIndices)])
+		}
+	}	
+
+	# now re-estimate these	
+	peakHeights = findPeakHeights(peakStartIndices, peakEndIndices, freqData_bandPassFiltered)
+	peakCenters = findPeakCenters(peakStartIndices, peakEndIndices, freqData_bandPassFiltered)	
+	
+	rm(indicesBelowThreshold)
+	
+
+
+	# GATING AND REFINING ESTIMATION
+	# find all peaks that meet these criteria:  
+	#    2 peaks within tDoubletGap[2] datapoints of each other and >tDoubletGap[1] datapoints between them. 
+	# 
+	
+	timeBetweenPeaks = diff(peakCenters)
+	
+	#this function indexes the set of peaks, not raw data!
+	findDoubletPeakIndices = function(diffTimes, heights){	
+		nextHeight = c(heights[-1], 1e5)
+		timeToPrev = c(1e4, diffTimes)
+		timeToNext = c(diffTimes, 1e4)
+		timeAfterNext = c( diffTimes[-1],1e4, 1e4)
+		which(timeToNext > tDoubletGap[1] & timeToNext < tDoubletGap[2] & abs(heights-nextHeight) < maxHeightDiff)  
+	}
+	doubletPeakIndices = findDoubletPeakIndices(timeBetweenPeaks, peakHeights)  
+  
+	findAverageDoubletHeight = function(i, peakCenters, plotTheFit=FALSE){
+		dataIndicesInRegion = max((peakCenters[i]-baselineSearchWidthSidePoints),1) : min(peakCenters[i+1]+baselineSearchWidthSidePoints, length(rawData))
+		dataInRegion = rawData[dataIndicesInRegion]
+    peak1Center = baselineSearchWidthSidePoints  # relative to region
+		peak2Center = baselineSearchWidthSidePoints+(peakCenters[i+1]-peakCenters[i])  # relative to region
+		
+		# truncate it so it has evenly sized chunks
+    chunkSize = floor(length(dataInRegion)/numBaselineChunks)
+		dataInRegion = dataInRegion[1:(numBaselineChunks*chunkSize)]
+		dataIndicesInRegion = dataIndicesInRegion[1:(numBaselineChunks*chunkSize)]
+    chunkSDs = apply(matrix(dataInRegion, ncol=numBaselineChunks), 2,sd)
+
+		preBaselineChunkIndex = which.min(chunkSDs[1:floor(peak1Center/chunkSize)])
+		postBaselineChunkIndex = which.min(chunkSDs[ceiling(peak2Center/chunkSize):length(chunkSDs)])+ceiling(peak2Center/chunkSize)-1
+    
+    tipSidePoints = round(tipSidePointFractionOfPeakWidth*(peak2Center-peak1Center))
+		baselineSegmentIndices = c( (preBaselineChunkIndex-1)*chunkSize + 1:chunkSize, 
+					  	   (postBaselineChunkIndex-1)*chunkSize + 1:chunkSize )
+		baselineSegments = rep(NA, length(dataInRegion))
+		baselineSegments[baselineSegmentIndices] = dataInRegion[baselineSegmentIndices]
+		t = 1:length(dataInRegion)
+    baselineModel = lm(baselineSegments~t)
+		baseline = predict(baselineModel, newdata=data.frame(t))
+
+		dataInRegion = dataInRegion - baseline
+		antinodeRegion1 = dataInRegion[ peak1Center + (-tipSidePoints):tipSidePoints+1 ]
+		antinodeRegion2 = dataInRegion[ peak2Center + (-tipSidePoints):tipSidePoints+1 ]
+    nodeRegion=dataInRegion[ peak1Center:peak2Center ]
+		t = 1:(2*tipSidePoints+1)
+		mod1 = lm(antinodeRegion1 ~ stats::poly(t,4))
+		mod2 = lm(antinodeRegion2 ~ stats::poly(t,4))
+		tripletPeakHeight = (min(predict(mod1)) + min(predict(mod2)))/2
+		
+		if (plotTheFit){
+		  plot(freqTime[dataIndicesInRegion], dataInRegion,xlab='Time (s)', ylab='buoy. mass (~pg)', cex=.7)
+		  lines(freqTime[dataIndicesInRegion], freqData_bandPassFiltered[dataIndicesInRegion], col='red')
+		  abline(h=0,col='grey',lty=2)
+		  points(freqTime[dataIndicesInRegion], baselineSegments-baseline, col='blue')
+		  lines(freqTime[t + peak1Center-tipSidePoints + min(dataIndicesInRegion) - 1], predict(mod1), col='green', lwd=2)
+		  lines(freqTime[t + peak2Center-tipSidePoints + min(dataIndicesInRegion) - 1], predict(mod2), col='green', lwd=2)
+		}
+		
+		return( c(-tripletPeakHeight, 
+      -min(predict(mod1)), 
+      -min(predict(mod2)), 
+      mean(baseline[c(peak1Center,peak2Center)]), 
+      max(nodeRegion),
+      coef(baselineModel)[2],
+      (peakCenters[i+1]-peakCenters[i]),
+      min(predict(mod2))-min(predict(mod1))
+      )
+		)
+	}	
+	
+	findPeakHeights = function(doubletPeakIndices, peakCenters){
+		peakParamDataFrame = t(sapply(doubletPeakIndices, findAverageDoubletHeight, peakCenters=peakCenters))
+    colnames(peakParamDataFrame) = c("massRaw","massRaw1","massRaw2","baseline","nodeDev", "baselineSlope","gap","antinodeDifferenceRaw")
+    peakParamDataFrame
+	}
+	
+	doubletPeakParams = findPeakHeights(doubletPeakIndices, peakCenters)
+	
+  # plot visualizeNum random peaks along with fits
+  if (visualizeNum!=0){
+    for (i in 1:visualizeNum){
+      j = sample(doubletPeakIndices,1)
+      findAverageDoubletHeight(j, peakCenters, plotTheFit=TRUE)
+    }
+  }
+  
+  if (length(doubletPeakIndices)==0) return(data.frame(time=NULL, mass=NULL)) # in case it's empty
+  peakParamDataFrame =  data.frame(time = freqTime[peakCenters[doubletPeakIndices]]/3600,	doubletPeakParams)
+  
+        return (list(singletsDetected=length(peakHeights), peakParamDataFrame=peakParamDataFrame)) 
+}
+
+
+
+
+# typically takes 5 minutes
+
+par(mfrow=c(6,5), mgp=c(1.5,.2,0), tck=-.015, mar=c(3,3,.5,.5), cex.lab=.8, cex.axis=.8)
+carriers = vector('double',length(files))
+singletsDetected = vector('double',length(files))
+
+for(f in 1:length(files)) {
+  cat("loading "%+%f%+%"...")
+	### read in, clean up, rescale and roughly normalize data
+	dat = readBin(files[f], n=3e7, what='integer', endian='swap')
+
+	removePacketIndices = function(x) {
+	  "%+%" <- function(x,y) paste(x,y,sep="")
+	  packetIndices = x[seq(1, length(x), by=129)]
+		filteredData = x[-seq(1, length(x), by=129)]
+	  g = diff(packetIndices)
+		if (!all(g %in% c(1, -65535)))
+			warning("POSSIBLE PACKET LOSS - lost sets of " %+% paste(names(table(g))[-c(1,2)], collapse=","))
+		filteredData
+	}
+
+	dat = removePacketIndices(dat)*12.5e6/2^32  #conversion factor from int to frequency
+	
+	if (f==length(files)){
+	  last.dat<-dat
+	}
+	
+	frontPad<-rep(dat[experimentTimeWindow[1]*dataRate*3600],experimentTimeWindow[1]*dataRate*3600)
+	backPad<-rep(dat[min(length(dat),(experimentTimeWindow[2]*dataRate*3600))],length(dat)-min(length(dat),(experimentTimeWindow[2]*dataRate*3600)))
+	
+  dat = dat[(experimentTimeWindow[1]*dataRate*3600 + 1):min(length(dat),(experimentTimeWindow[2]*dataRate*3600))]
+  # keep this around, we'll use it for plotting
+  
+  if (padTrimmedData==TRUE){
+    if (length(frontPad)!=0){
+     dat<-c(frontPad,dat,backPad) 
+    }
+    if (length(backPad)>0){
+      dat<-c(dat,backPad)
+    }
+    }
+  
+	dat.decimated[[f]] = colMeans(matrix(dat[1:(plotDec*floor(length(dat)/plotDec))], nrow=plotDec)) 
+
+
+	# approximately normalize signals
+	carriers[f] = median(dat[(length(dat)-1e4):length(dat)])
+	dat = dat / (carriers[f]/minCarrier)^1.5/minSensitivityEstimate # relative, ballpark sensitivity estimate
+
+	cat(" filtering...")
+	### filter section ###
+	# nonlinear then linear low-pass filter
+	dat.lp = signal::sgolayfilt(runmed(dat, k=medLength),p=sgOrder, n=sgLength)
+
+	# nonlinear high-pass filter
+  i = seq(floor(quantileDownsamplingFactor/2),length(dat.lp), by=quantileDownsamplingFactor)
+  dat.hp = rep(runquantile(dat.lp[i], k=floor(quantileWidth/quantileDownsamplingFactor), probs=quantileProb),each=quantileDownsamplingFactor)[1:length(dat.lp)]
+	dat.bp =  dat.lp - dat.hp
+
+	dat.bp.decimated[[f]] = colMeans(matrix(dat.bp[1:(plotDec*floor(length(dat.bp)/plotDec))], nrow=plotDec))
+
+	cat(" detecting...\n")
+  peakDetectionResults = getPeaks(
+        	dat.bp,
+        	dat,
+        	detectionThreshold=detectionThreshold, 
+		tDoubletGap=tDoubletGap, 
+		maxHeightDiff=maxHeightDiff,
+		baselineSearchWidthSidePoints=baselineSearchWidthSidePoints,
+		numBaselineChunks= numBaselineChunks,
+		tipSidePointFractionOfPeakWidth=tipSidePointFractionOfPeakWidth,
+        	visualizeNum=0
+	)
+  
+  singletsDetected[f] = peakDetectionResults$singletsDetected
+  detectedPeaks[[f]] = peakDetectionResults$peakParamDataFrame
+  
+  detectedPeaks[[f]] = detectedPeaks[[f]][detectedPeaks[[f]][,2] > abs(detectionThreshold), ]
+  detectedPeaks[[f]]
+}
+
+@
+
+
+
+
+
+
+<<peakCharacteristicMarginals, echo=FALSE,warning=FALSE>>=
+par(mfrow=c(2,2))
+plot(-1,-1,xlab='time gap between antinodes (indices)', ylab='probability density', xlim=tDoubletGap,ylim=c(0,5/(tDoubletGap[2]-tDoubletGap[1])))
+for (i in 1:length(files)){
+  lines(density(detectedPeaks[[i]]$gap), col=cols[i])
+}
+
+xlim=range(sapply(detectedPeaks, function(x) range(x$baselineSlope)))
+plot(-1,-1, xlim=xlim, ylim=c(0,10/max(xlim)), xlab='baseline slope', ylab='probability density')
+for (i in 1:length(files)){
+  lines(density(detectedPeaks[[i]]$baselineSlope), col=cols[i])
+}
+
+xlim=range(sapply(detectedPeaks, function(x) range(x$massRaw)))
+ylim=range(sapply(detectedPeaks, function(x) range(x$massRaw2-x$massRaw1)))
+
+plot(-1,-1,xlim=xlim, ylim=ylim, xlab='rough mass estimate (pg)', ylab='Peak height mismatch (~pg)')
+for (i in 1:length(files)){
+  points(detectedPeaks[[i]]$massRaw, detectedPeaks[[i]]$massRaw2-detectedPeaks[[i]]$massRaw1, pch=16,cex=.5, col=cols[i])
+}
+@
+
+
+<<outlierFiltering, echo=FALSE,results='asis',warning=FALSE>>=
+par(mfrow=c(4,3), mar=c(4,4,1,1), mgp=c(1.5,.5,0), tck=-.015)
+
+detectedcellpeaks<-list()
+detectedbeadpeaks<-list()
+
+if (beadDetect== 1){ 
+  for (i in 1:length(files)){
+    detectedcellpeaks[[i]]<-subset(detectedPeaks[[i]],detectedPeaks[[i]]$massRaw>calibrationBounds[2]|detectedPeaks[[i]]$massRaw<calibrationBounds[1]|detectedPeaks[[i]]$time<beadTimeWindow[1]|detectedPeaks[[i]]$time>beadTimeWindow[2])
+       detectedbeadpeaks[[i]]<-subset(detectedPeaks[[i]],detectedPeaks[[i]]$massRaw<calibrationBounds[2]&detectedPeaks[[i]]$massRaw>calibrationBounds[1]&detectedPeaks[[i]]$time>beadTimeWindow[1]&detectedPeaks[[i]]$time<beadTimeWindow[2])
+    }
+  origdetectedcell<-detectedcellpeaks
+  origdetectedbead<-detectedbeadpeaks
+} else if (beadDetect == 2){  
+    for (i in 1:length(files)){ 
+    detectedcellpeaks[[i]]<-subset(detectedPeaks[[i]],detectedPeaks[[i]]$massRaw>calibrationBounds[2]|detectedPeaks[[i]]$massRaw<calibrationBounds[1])
+    detectedbeadpeaks[[i]]<-subset(detectedPeaks[[i]],detectedPeaks[[i]]$massRaw<calibrationBounds[2]&detectedPeaks[[i]]$massRaw>calibrationBounds[1])
+    }  
+  origdetectedcell<-detectedcellpeaks
+  origdetectedbead<-detectedbeadpeaks
+} 
+
+nPeaksDropped = NULL
+for (i in 1:length(files)){ 
+  # use nodeDev, baselineSlope, gap, and antinode difference
+  d=detectedcellpeaks[[i]][,c("baselineSlope","gap","antinodeDifferenceRaw")]
+  mu = apply(d,2,median)
+  mhDist = mahalanobis(d, mu,cov.rob(d)$cov)
+  
+  h=hist(mhDist,plot=FALSE,breaks=2000)
+  plot(h$mids,h$counts, log='xy',type='o',xlab='Mahalanobis distance (robust)', ylab='Count',col=cols[i])
+  if (is.na(outlierDetectionThreshold)) {
+    nPeaksDropped = c(nPeaksDropped,0)
+    next
+  }
+  mhDistCutoff = qchisq(outlierDetectionThreshold,df=ncol(d),lower.tail=FALSE,log=TRUE)
+  abline(v=mhDistCutoff)
+  lines(h$mids, dchisq(h$mids,df=ncol(d))*nrow(d)*diff(h$mids)[1],col='red')
+  
+  keepPeaks = which(mhDist<mhDistCutoff)
+  nPeaksDroppedcell = c(nPeaksDropped, sum(mhDist>=mhDistCutoff))
+  detectedcellpeaks[[i]] = detectedcellpeaks[[i]][keepPeaks,] 
+} 
+
+for (i in 1:length(files)){ 
+  # use nodeDev, baselineSlope, gap, and antinode difference
+  d=detectedbeadpeaks[[i]][,c("baselineSlope","gap","antinodeDifferenceRaw")]
+  mu = apply(d,2,median)
+  mhDist = mahalanobis(d, mu,cov.rob(d)$cov)
+  
+  h=hist(mhDist,plot=FALSE,breaks=2000)
+  plot(h$mids,h$counts, log='xy',type='o',xlab='Mahalanobis distance (robust)', ylab='Count',col=cols[i])
+  if (is.na(outlierDetectionThreshold)) {
+    nPeaksDropped = c(nPeaksDropped,0)
+    next
+  }
+  mhDistCutoff = qchisq(outlierDetectionThresholdBead,df=ncol(d),lower.tail=FALSE,log=TRUE)
+  abline(v=mhDistCutoff)
+  lines(h$mids, dchisq(h$mids,df=ncol(d))*nrow(d)*diff(h$mids)[1],col='red')
+  
+  keepPeaks = which(mhDist<mhDistCutoff)
+  nPeaksDroppedbead = c(nPeaksDropped, sum(mhDist>=mhDistCutoff))
+  detectedbeadpeaks[[i]] = detectedbeadpeaks[[i]][keepPeaks,] 
+  detectedPeaks[[i]] = rbind(detectedbeadpeaks[[i]],detectedcellpeaks[[i]])
+} 
+
+xtable(data.frame(Detected = singletsDetected/2, 
+                  FilterStage1=nPeaksDroppedcell+nPeaksDroppedbead+sapply(detectedPeaks, nrow),
+                  DetectedCells=sapply(origdetectedcell,nrow),
+                  FilteredCells=sapply(detectedcellpeaks,nrow),
+                  DetectedBeads=sapply(origdetectedbead,nrow),
+                  FilteredBeads=sapply(detectedbeadpeaks,nrow),
+                  OutlierFilter=sapply(detectedPeaks, nrow)))
+@
+
+
+<<allSensorPlot, echo=FALSE,fig=TRUE,dev='png',dpi=300>>=
+
+par(mfrow=c(1,1), tck=-.015, mgp=c(2,.8,0))
+ymin = min(sapply(dat.decimated,function(x) min(x-x[1])))
+ymax = max(sapply(dat.decimated,function(x) max(x-x[1])))
+for (i in 1:length(files)){
+  d = dat.decimated[[i]]
+  if (i==1)
+	  plot(1:length(d)*plotDec/dataRate/60, d-d[1], type='l', bty='n', col=cols[i], 
+         ylim=c(ymin,ymax), ylab='Frequency (Hz)', xlab='Time (minutes)')
+  else {
+    lines(1:length(d)*plotDec/dataRate/60, d-d[1],col=cols[i])
+  }
+}
+
+@
+
+<<allSensorPlotFiltered, echo=FALSE,fig=TRUE,dev='png',dpi=300>>=
+### plot all detected peaks!
+
+par(mfrow=c(length(sensorsToKeep),1), mar=c(1,3,0,1), oma=c(3,3,1,0), tck=-.015, mgp=c(2,.8,0))
+ymin = round(range(unlist(lapply(detectedPeaks, function(x){quantile(x[,2],.98)} )))[2],2) # round to nearest 10
+for (i in sensorsToKeep){
+	d = dat.bp.decimated[[i]]
+	plot(1:length(d)*plotDec/dataRate/60, d, type='l', ylim=c(-ymin,0), bty='n', ylab='', xlab='',
+		xaxt=ifelse(i==length(files),'s','n'), yaxt='n',col=cols[i])
+	abline(h=detectionThreshold, lty=2, col='grey')
+	points(detectedPeaks[[i]][,1]*60, -pmin(detectedPeaks[[i]][,2],ymin), col='dodgerblue', pch=16, cex=.8)
+	#textxy(detectedPeaks[[i]][,1]*60, -pmin(detectedPeaks[[i]][,2],ymin), 1:nrow(detectedPeaks[[i]]), cex=1)
+	axis(2, las=2, at=c(0,-ymin))
+}
+mtext(side=1, 'Time (minutes)', adj=.5, line=2.3)
+mtext(side=2, 'Buoyant mass (pg)', adj=.5, line=.5, outer=T)
+@
+
+
+
+<<marginalsBeforeCorrection, echo=FALSE,fig=TRUE>>=
+### plot marginals (histograms) before correction
+
+par(mfrow=c(length(sensorsToKeep),1), mar=c(1,3,0,1), oma=c(3,3,1,0), tck=-.015, mgp=c(2,.2,0))
+ymin = max(unlist(lapply(detectedPeaks, function(x){max(x[,2])} )),na.rm=T)
+for (i in sensorsToKeep){
+  d = detectedPeaks[[i]]$massRaw[detectedPeaks[[i]]$massRaw > 0] 
+  if (length(d)==0) {
+    plot(1,1)
+    next
+  }
+  h=hist(d, xlim=c(0,ymin), main="", breaks=200,col=cols[i])
+  lines(0:ymin, ecdf(d)(0:ymin)*max(h$counts), col='blue',lty=2)
+  abline(v=calibrationBounds, col='red')
+}
+mtext(side=1, 'Buoyant mass (pg)', adj=.5, line=.5, outer=T)
+@
+
+
+
+<<calibrations, echo=FALSE,fig=TRUE>>=
+mb = 4/3*pi*(calibrationBeadDiameter/2*1e-4)^3* (beadMaterialDensity-mediaDensity) *1e12 	# pg /bead
+experimentTotalTime = length(dat.bp.decimated[[1]])*plotDec/dataRate/3600 
+
+par(mfrow=c(3,1), mgp=c(1.5,.2,0), tck=-.015, mar=c(3,3,.5,.5), cex.lab=.8, cex.axis=.8)
+estimatedSensitivities = rep(1,n-1)
+
+par(mfrow=c(4,3))
+
+for (i in sensorsToKeep){
+
+# NLC edit 07/27/16
+	a= detectedPeaks[[i]]$massRaw
+
+  if (length(a)== 0) next
+	a = a[a>calibrationBounds[1] & a<calibrationBounds[2] & 
+          experimentTotalTime - detectedPeaks[[i]]$time > (length(files)-i)*timeGap.mu ]
+ dens = density(a, bw=densityBandwidth, n=2^13);
+  
+ plot(dens,xlim=c(calibrationBounds),col=cols[i],lwd=2); 
+  legend('topright', c("bw="%+%round(dens$bw,3), "n="%+%length(a),"mad="%+%round(mad(a),4)), bty='n')
+  abline(v=dens$x[which.max(dens$y)])
+  estimatedSensitivities[i] = dens$x[which.max(dens$y)]/mb
+
+  
+beadmassraw <- detectedPeaks[[i]]$massRaw
+beadtime <- detectedPeaks[[i]]$time
+beadcarrier <-detectedPeaks[[i]]$baseline
+beads<-data.frame(beadmassraw,beadtime,beadcarrier)
+beads<-beads[which(beadmassraw>calibrationBounds[1]&beadmassraw<calibrationBounds[2]),]
+mod<-lm(beads[,1]~beads[,2])
+plot(beads[,2],beads[,1],ylim=calibrationBounds)
+abline(mod,lty=2,lwd=3,col='red')
+abline(h=dens$x[which.max(dens$y)],lty=2)
+legend('topright',c('Sensitivity =',round(coef(mod)[1],digits=3),'-',round(coef(mod)[2],digits=3),'*time'))
+plot(beads[,3],beads[,1],xlim=c(max(beads[,3]),min(beads[,3])))
+mod2<-lm(beads[,1]~beads[,3])
+abline(mod2,lty=2,lwd=3,col='red')
+abline(h=dens$x[which.max(dens$y)],lty=2)
+legend('topright',c('Sensitivity =',round(coef(mod2)[1],digits=3),'-',round(coef(mod2)[2],digits=3),'*carrier'))
+
+
+if (beadcalibtype == 2){
+  
+  detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]/((coef(mod)[2]*detectedPeaks[[i]]$time+coef(mod)[1])/mb)
+  #detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]
+  dat.bp.decimated[[i]] = dat.bp.decimated[[i]]/estimatedSensitivities[i] # we'll save this later, make sure we save it in units of pg
+  detectedPeaks[[i]]$nodeDev = detectedPeaks[[i]]$nodeDev/((coef(mod)[2]*detectedPeaks[[i]]$time+coef(mod)[1])/mb)
+#   legend('topright', c("bw="%+%round(dens$bw,3), "n="%+%length(a),"mad="%+%round(mad(a),4)), bty='n')
+} else if (beadcalibtype == 1){
+  
+  detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]/estimatedSensitivities[i]
+  #detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]
+  dat.bp.decimated[[i]] = dat.bp.decimated[[i]]/estimatedSensitivities[i] # we'll save this later, make sure we save it in units of pg
+  detectedPeaks[[i]]$nodeDev = detectedPeaks[[i]]$nodeDev/estimatedSensitivities[i]
+
+  
+}else if (beadcalibtype == 3){
+detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]/((coef(mod2)[2]*detectedPeaks[[i]]$baseline+coef(mod2)[1])/mb)
+  #detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]
+  dat.bp.decimated[[i]] = dat.bp.decimated[[i]]/estimatedSensitivities[i] # we'll save this later, make sure we save it in units of pg
+  detectedPeaks[[i]]$nodeDev = detectedPeaks[[i]]$nodeDev/((coef(mod2)[2]*detectedPeaks[[i]]$baseline+coef(mod2)[1])/mb)
+}
+else if (beadcalibtype == 4){
+  importedsens<-read.csv(file = sensitivityfile)
+  importedsens<-as.numeric(importedsens[,2])
+  estimatedSensitivities<-(importedsens)/((carriers/minCarrier)^1.5*minSensitivityEstimate)
+detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]/estimatedSensitivities[i]
+  #detectedPeaks[[i]]$mass = detectedPeaks[[i]][,2]
+  dat.bp.decimated[[i]] = dat.bp.decimated[[i]]/estimatedSensitivities[i] # we'll save this later, make sure we save it in units of pg
+  detectedPeaks[[i]]$nodeDev = detectedPeaks[[i]]$nodeDev/estimatedSensitivities[i]
+
+}
+}
+@
+
+
+
+<<carrierVsSensitivity, echo=FALSE,fig=TRUE>>=
+### now plot growth trajectories
+par(mfrow=c(1,1))
+sensitivities = (carriers/minCarrier)^1.5*minSensitivityEstimate*estimatedSensitivities
+plot(carriers/1e3, sensitivities, log='xy', ylab='Sensitivity (Hz/pg)', xlab='Carrier frequency (kHz)',col=cols,pch=16,xlim=c((minCarrier/1E3-25),(max(carriers)/1E3+50)),ylim=c(0.4,1))
+freqRange = seq(min(carriers),max(carriers),length.out=100)/1e3
+lines(freqRange, (freqRange*1e3/minCarrier)^1.5*minSensitivityEstimate, lty=2)
+write.csv(cbind(sensitivities,carriers),paste(directory,"Mode-sensitivities.csv"))
+@
+
+<<carrierAndSensitivityTable,echo=FALSE,results='asis'>>=
+xtable(data.frame(Frequency=carriers, Sensitivity=sensitivities), digits=c(1,0,4))
+@
+
+
+<<nodeDeviationVsMass,echo=FALSE,results='asis'>>=
+par(mfrow=c(6,4), mar=c(3,3,1,1), mgp=c(1.5,.2,.0), tck=-.015)
+
+for (i in sensorsToKeep){  
+  d= detectedPeaks[[i]]
+  q<-subset(d,d$mass>calibrationBounds[2])
+  plot(d$mass, d$nodeDev, xlab='Buoyant mass (pg)', ylab='nodal deviation from baseline (pg)', 
+       pch=16,cex=.5, main='sensor '%+%i,col=cols[i])
+  abline(h=0, lty=2, col='grey') 
+  abline(v=cellSizeRange, lty=2, col='grey')
+  abline(a=0,b=ndevpermasscutoff*carriers[i]/(mean(carriers)))
+  plot(q$nodeDev/q$mass)
+  abline(h=ndevpermasscutoff*carriers[i]/(mean(carriers)),col='red',lty=2)
+  detectedPeaks[[i]]<-rbind(subset(q,q$nodeDev/q$mass>=ndevpermasscutoff*carriers[i]/(mean(carriers))),subset(d,d$mass<calibrationBounds[2]))
+                      
+  } 
+    
+@
+
+
+<<overlaidTrajectories, echo=FALSE,fig=TRUE,fig.height=9,fig.width=7>>=
+experimentTotalTime = length(dat.bp.decimated[[1]])*plotDec/dataRate/3600 
+par(mfrow=c(1,1))
+for (i in length(files):1){
+  p = detectedPeaks[[i]]
+  if(i==length(files))
+    plot(p$time, p$mass, pch=16,  ylim=range(c(mb, cellSizeRange)), col=cols[i], log='',
+         xlab='time (h)', ylab='buoyant mass (pg)', xlim=c(0,experimentTotalTime))
+  if (i!=length(files))
+    points(p$time, p$mass, pch=16, col=cols[i])
+
+
+}
+abline(h=mb, col='grey', lty=2,lwd=2)
+@
+
+
+
+
+<<matchedPointOverlay, echo=FALSE,fig=TRUE,fig.height=9,fig.width=7,eval=TRUE>>=
+### Now we start matching things
+
+
+
+cell = function(m, t, i, sensor=NULL, nSensors=NULL){
+	# two use cases - fully populated m, t and i vectors (including NAs), or
+  #                 scalar m,t,i, and nonzero sensor, nSensors
+  if (length(m)!=length(t) || length(m)!=length(i)) stop("mass, time and index lengths don't match.")
+	if (all(which(!is.na(m)) != which(!is.na(t)))) stop("mass and time don't agree on which measurements were made.")
+	if (length(m) == 1 & (is.null(sensor) | is.null(nSensors)) ) stop('single peak initializiation requires both sensor and nSensors to be specified')
+
+  	if (length(m) == 1 ){
+    		na = rep(NA, nSensors)
+    		m.temp = na; m.temp[sensor] = m; m=m.temp;
+		t.temp = na; t.temp[sensor] = t; t=t.temp;
+    		i.temp = na; i.temp[sensor] = i; i=i.temp;
+  	}
+    
+	sensorsUsed = which(!is.na(m))
+	nSensorsUsed = length(sensorsUsed)
+	gr = rep(NA,4);
+	if (nSensorsUsed>1) gr = coef(summary(lm(m~t)))[2,]
+	
+	a = list(mass = m, time=t, indices = i,
+			avgMass = mean(m, na.rm=T), 
+			avgTime=mean(t, na.rm=T),
+			gr=gr,
+			sensorsUsed = sensorsUsed, 
+			nSensorsUsed = nSensorsUsed,
+			lastSensorUsed = max(sensorsUsed),
+			lastMass = m[max(which(!is.na(t)))],
+			lastTime = t[max(which(!is.na(t)))],
+      picture=NULL)
+	class(a) = "cell"
+	a
+}
+
+joinCells = function(c1, c2){
+  	if (class(c1) != 'cell' || class(c2)!= 'cell' ) stop("c1 and c2 must be cell objects.")
+	if ( any( c1$sensorsUsed %in% c2$sensorsUsed)) stop('cant merge: overlapping measurements.')
+	
+	m = c1$mass; 
+	m[c2$sensorsUsed] = c2$mass[c2$sensorsUsed];
+	t=c1$time
+	t[c2$sensorsUsed] = c2$time[c2$sensorsUsed];
+	i = c1$indices; 
+	i[c2$sensorsUsed] = c2$indices[c2$sensorsUsed];
+	cell(m,t,i)
+}	
+
+plot.cell = function(c1, pad.x=.2, pad.y=.3, annotate=TRUE, ...){
+  xlim = range(c1$time,na.rm=T) + c(-1,1)*diff(range(c1$time,na.rm=T))*pad.x
+  ylim = range(c1$mass,na.rm=T) + c(-1,1)*diff(range(c1$mass,na.rm=T))*pad.y
+	plot(c1$time, c1$mass, xlim=xlim, ylim=ylim,  ...)
+  abline(v=c1$time, lty=2,col='grey')
+	text(c1$time, c1$mass, 1:length(c1$mass),pos=4,cex=.7)
+	if (c1$nSensorsUsed>1) abline(lm(c1$mass ~ c1$time), col='red');
+  if (annotate & c1$nSensorsUsed > 2){
+    RMSE = sd(residuals(lm(na.omit(c1$mass)~na.omit(c1$time))))
+    text(xlim[1],ylim[1], srt=90, "GR="%+%round(c1$gr[1],3)%+%"\nRMSE="%+%round(RMSE,5), pos=4,cex=.8)
+  }
+}
+
+points.cell = function(c1,...){
+  points(c1$time, c1$mass, ...)
+  abline(v=c1$time, lty=2,col='grey')
+	text(c1$time, c1$mass, 1:length(c1$mass),pos=4,cex=.8)
+	if (c1$nSensorsUsed>1) abline(lm(c1$mass ~ c1$time), col='red');
+}
+
+detectedPeaksToCellList = function(peakData,sensor,cellSizeRange){
+	cells = list()
+	i = 1
+	for (j in 1:nrow(peakData)){
+		if (peakData$mass[j] > cellSizeRange[1] & peakData$mass[j] < cellSizeRange[2]){
+  			cells[[i]] = cell(m=peakData$mass[j], 
+                       		t=peakData$time[j],
+                       		i=j,
+                       		sensor=sensor,
+                       		nSensors=length(files)
+                  			)
+			i=i+1
+		}
+	}
+	cells
+}
+
+
+peakMatchingCostMatrix = function(cellList, newCellList, mass.sd, gr.sd.prior, gr.mu.prior, timeGap.mu, timeGap.sd, gapCost) {
+	n1 = length(cellList)
+  n2 = length(newCellList)
+  m = matrix(nrow=length(cellList),ncol=length(newCellList))
+
+  for (i in 1:length(cellList)){
+    for (j in 1:length(newCellList)){
+      m[i,j] = -cellMatchLogLik(newCellList[[j]], cellList[[i]], mass.sd, gr.sd.prior, gr.mu.prior, timeGap.mu, timeGap.sd)
+    }
+  }
+    
+	m[is.infinite(m)] = 1e12; # very unlikely but possible if two peaks occur simultaneously
+
+	mat = matrix(gapCost, nrow=2*max(n1, n2), ncol=2*max(n1,n2))
+	mat[1:n1, 1:n2] = m;
+	mat[(n1+1):nrow(mat), (n2+1):ncol(mat)] = 0
+	mat
+}
+
+
+
+
+cellMatchLogLik = function(newCell, oldCell, mass.sd, gr.sd.prior, gr.mu.prior,timeGap.mu, timeGap.sd){
+  
+  tPrev = oldCell$time[oldCell$sensorsUsed]
+	mPrev = oldCell$mass[oldCell$sensorsUsed]
+	tNew = newCell$time[newCell$lastSensorUsed]
+	mNew = newCell$mass[newCell$lastSensorUsed]
+  timeGap = (tNew - oldCell$time[oldCell$lastSensorUsed])
+  if (timeGap < 0) return(-1e5)
+  sensorGap = newCell$lastSensorUsed - oldCell$lastSensorUsed
+    
+	# mean-center time such that growth rate and intercept parameters are uncorrelated;
+	tNew = tNew-mean(tPrev); tPrev = tPrev-mean(tPrev); 
+
+	# posterior parameters for growth rate (based on normal prior with known regression variance)
+	gr.sd = 1 / sqrt( 1/gr.sd.prior^2 + t(tPrev)%*%tPrev/mass.sd^2 )
+	gr.mu = gr.sd^2 * (gr.mu.prior/gr.sd.prior^2 + t(tPrev)%*%mPrev/mass.sd^2)
+
+	# ballparked posterior parameters for intercept (mean mass)
+	m.mu = mean(mPrev, na.rm=T)
+	m.sd = mass.sd/sqrt(length(mPrev))
+
+	# assuming 
+	mNew.mu = gr.mu*tNew + m.mu
+	mNew.sd = sqrt(tNew^2*gr.sd^2 + m.sd^2 + mass.sd^2)
+  logLikelihood = dnorm(mNew, mNew.mu, mNew.sd,log=TRUE) + dnorm(timeGap/sensorGap, timeGap.mu,timeGap.sd,log=TRUE)
+  
+	return( logLikelihood  )
+}
+
+
+
+
+# first initialize the list to include all peaks in the first cantilever
+beadSizeRange = (mb*range(calibrationBounds)/mean(calibrationBounds))
+firstSensor=1; secondSensor=2;
+if (length(sensorsToDrop)>0){
+  firstSensor = (1:length(files))[-sensorsToDrop][1]
+  secondSensor = (1:length(files))[-sensorsToDrop][2]
+}
+d = detectedPeaks[[firstSensor]]
+d<-subset(d,d$mass>beadSizeRange[2]|d$mass<beadSizeRange[1]|d$time<beadTimeWindow[1]|d$time>beadTimeWindow[2])
+d<-subset(d,d$time>cellTimeWindow[1]&d$time<cellTimeWindow[2])
+
+
+cellList = detectedPeaksToCellList(d,firstSensor,cellSizeRange)
+
+par(mfrow=c(4,3))
+
+for (i in secondSensor:length(files)){
+	if (i %in% sensorsToDrop) next
+  
+	#initialize every peak in sensor i as its own cell
+  d = detectedPeaks[[i]]
+  d<-subset(d,d$mass>beadSizeRange[2]|d$mass<beadSizeRange[1]|d$time<beadTimeWindow[1]|d$time>beadTimeWindow[2])
+  d<-subset(d,d$time>cellTimeWindow[1]&d$time<cellTimeWindow[2])
+
+	newCellList = detectedPeaksToCellList(d,i,cellSizeRange)
+
+  cat('matching '%+%length(cellList) %+% ' existing cells with ' %+% length(newCellList) %+% ' in sensor ' %+% i %+% "\n")
+  # now we're going to match up newCellList with cellList
+	costs = peakMatchingCostMatrix(cellList, newCellList, mass.sd, gr.sd.prior, gr.mu.prior, timeGap.mu, timeGap.sd, gapCost)
+	solution = solve_LSAP(costs - min(costs))
+	hist(costs[cbind(1:length(cellList),solution[1:length(cellList)])], xlab='solution costs', main='matching to sensor '%+%i,breaks=50)
+	# for every cell in the cellList, update it if we matched it
+	for (j in 1:length(cellList)){
+		if (solution[j] <= length(newCellList)) {# then we've matched it.
+			cellList[[j]] = joinCells(cellList[[j]], newCellList[[solution[j]]])
+		}  # otherwise, do nothing (unmatched cells stay in the cellList) 
+	}
+
+	# for every cell in the newCellList, if we didn't match it, add it to cellList
+	for (j in (length(cellList)+1):nrow(costs)){ # check every gap in "from" sensor
+		if (solution[j] <= length(newCellList))
+			cellList[[length(cellList)+1]] = newCellList[[ solution[j] ]]		
+	}
+}
+
+par(mfrow=c(1,1))
+plot(0,0, xlim=c(0,experimentTotalTime), ylim=cellSizeRange, xlab='time (hours)', ylab='buoyant mass (pg)', log='')
+for (i in cellList) {
+	if (i$nSensorsUsed>=trapLengthCutoff) {
+    points(i$time, i$mass, col=cols[sample((1:length(files))[sensorsToKeep],1)], pch=16); 
+    lines(na.omit(i$time), predict(rlm(i$mass~i$time)), lwd=2, col=adjustcolor('black',0.4))
+    text(na.omit(i$time), na.omit(i$mass), labels=i$sensorsUsed, cex=.5)
+  } else {
+    points(i$time, i$mass, col='#33333333', pch=16); 
+    text(na.omit(i$time), na.omit(i$mass), labels=i$sensorsUsed, cex=.5)
+  }
+}
+
+@
+
+<<matchingStatistics,echo=FALSE,results='asis',eval=TRUE>>=
+nSensorsUsed = sapply(cellList,function(x){x$nSensorsUsed})
+cellTrapDurations = sapply(cellList,function(x){diff(range(x$time,na.rm=T))})*60
+boxplot(cellTrapDurations ~ factor(nSensorsUsed,levels=1:length(sensorsToKeep)),ylab='cell measurement duration (min)', pch="x",xlab='number of sensors used')
+axis(3,at=as.numeric(names(table(nSensorsUsed))),labels=paste('n=', table(nSensorsUsed),sep=''),las=2)  
+@
+
+<<individualTrajectories, echo=FALSE,fig=TRUE,fig.height=12,fig.width=10,out.width="1\\linewidth",eval=TRUE>>=
+par(mfrow=c(9,5), mar=c(1,1,0,0), tck=.01, mgp=c(1,0,0))
+coefs = array(dim=c(0,7))
+j=1
+nPlotted=0
+for(i in cellList){
+  if (i$nSensorsUsed < trapLengthCutoff) next
+	m = i$mass
+	t= i$time-mean(i$time, na.rm=T)
+  mod=lm(m~t)
+  if (nPlotted < numSingleTraj){
+    plot(i,pad.x=.5,pad.y=.5)
+    for (k in length(files):1){
+      p = detectedPeaks[[k]]
+      #points(p$time, p$mass, pch=1, col=cols[k])
+      text(p$time,p$mass, k, cex=.8, col=cols[k])
+    }
+    points(i,cex=1.3, col=cols, bg=rep('black',length(cols)),pch=21)
+    nPlotted=nPlotted+1
+	}
+  coefs = rbind(coefs, c(i$avgTime,coef(summary(mod))[1:2,1:2],sum((residuals(mod))^2)/length(residuals(mod)),length(residuals(mod))))
+  j=j+1
+}
+colnames(coefs) = c('avgTime', 'avgMass','gr','avgMass.se','gr.se','av.sqrd.gr.residual','# cant')
+@
+
+<<massVsGrowthRate, echo=FALSE,fig=TRUE,eval=TRUE>>=
+par(mfrow=c(2,2), mar=c(3,3,1,1), mgp=c(1.5,.2,0), tck=-.015)
+plotCI(coefs[,2], coefs[,3], uiw=coefs[,5], xlim=c(0,cellSizeRange[2]), gap=0, sfrac=0, pch=16,
+	xlab='Buoyant mass (pg)', ylab='Mass accumulation rate (pg/hr)')
+abline(lm(coefs[,3]~coefs[,2]), col='red')
+abline(h=0, col='grey', lty=2)
+legend('topright', paste('(+) n=',sum(coefs[,3]>0)))
+legend('bottomright', paste('(-) n=', sum(coefs[,3]<0)))
+
+plotCI(coefs[,1], coefs[,3], uiw=coefs[,5], gap=0, sfrac=0,
+  xlab='Time (hours)', ylab='Mass accumulation rate (pg/hr)')
+abline(h=0, col='grey', lty=2)
+
+plotCI(coefs[,2], coefs[,3]/coefs[,2], uiw=coefs[,5]/coefs[,2], gap=0, sfrac=0,
+  xlab='Buoyant mass (pg)', ylab='MAR per mass (/hr)', xlim=c(0,cellSizeRange[2]) )
+abline(h=0, col='grey', lty=2)
+
+plotCI(coefs[,1], coefs[,3]/coefs[,2], uiw=coefs[,5]/coefs[,2], gap=0, sfrac=0,
+  xlab='Time (hours)', ylab='MAR per mass (/hr)' )
+abline(h=0, col='grey', lty=2)
+@
+
+
+<<tables2 pruned, echo=FALSE,results='asis',warning=FALSE>>=
+# Reads settings tables
+
+poscoefs<-subset(coefs,coefs[,3]>0)
+negcoefs<-subset(coefs,coefs[,3]<0)
+poscoefs<-cbind(poscoefs,poscoefs[,3]-poscoefs[,5])
+negcoefs<-cbind(negcoefs,negcoefs[,3]+negcoefs[,5])
+Number_within_Zero<-rbind(subset(poscoefs,poscoefs[,8]<0),subset(negcoefs,negcoefs[,8]>0))
+
+Mean_Mass<-mean(coefs[,2])
+Mean_MAR<-mean(coefs[,3])
+Mean_MAR_Error<-mean(coefs[,5])
+Mean_MAR_per_mass<-mean(coefs[,3]/coefs[,2])
+Mean_MAR_per_mass_error<-mean(coefs[,5]/coefs[,2])
+NumTotalCells<-nrow(coefs)
+NumConfidentPosCells<-nrow(subset(poscoefs,poscoefs[,8]>0))
+NumConfidentNegCells<-nrow(subset(negcoefs,negcoefs[,8]<0))
+Number_within_Error_of_Zero<-nrow(Number_within_Zero)
+
+output<-rbind(Mean_Mass,
+                  Mean_MAR,
+                  Mean_MAR_Error,
+                  Mean_MAR_per_mass,
+                  Mean_MAR_per_mass_error,
+                  NumTotalCells,
+                  NumConfidentPosCells,
+                  NumConfidentNegCells,
+                  Number_within_Error_of_Zero)
+
+xtable(data.frame(output),digits=c(4), caption="All matched cells")
+
+@
+
+<<massVsGrowthRatepruned, echo=FALSE,fig=TRUE,eval=TRUE>>=
+par(mfrow=c(1,2),mar=c(4,4,3,1))
+residcols<-rainbow(length(sensorsToKeep))
+residcols<-residcols[trapLengthCutoff:length(sensorsToKeep)]
+
+residlegends<-vector(mode="character",length=length(sensorsToKeep))
+for (i in trapLengthCutoff:length(sensorsToKeep)){
+  residlegends[i]<-paste(i," Cantilevers matched")
+}
+residlegends<-residlegends[trapLengthCutoff:length(o)]
+residlegends<-residlegends[!is.na(residlegends)]
+
+plot(coefs[,5],coefs[,6],xlab='gr.se', ylab='Mean squared residual',col=residcols[coefs[,7]-trapLengthCutoff+1],pch=16,main='Growth rate errors')
+legend("topleft",residlegends,fill =residcols,bty="n",cex=.8)
+plot(coefs[,5]/coefs[,2],coefs[,6]/coefs[,2],xlab='Mass Normalized gr.se', ylab='Mass Normalized Mean squared residual',col=residcols[coefs[,7]-trapLengthCutoff+1],pch=16,main='Mass normalized GR. errors')
+
+
+
+for (i in 0:(sdtoprune+2)){
+mod <- lm(c(0,mean(coefs[,6]/coefs[,2]+i*sd(coefs[,6]/coefs[,2])))~c(mean(coefs[,5]/coefs[,2])+i*sd(coefs[,5]/coefs[,2]),0))
+m<-coef(summary(mod))[2,1]
+#Y intercept
+yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+  abline(a=yintercept,b=m)
+legend(x=0,y=yintercept,legend=paste(i,'SD'),bty="n",xjust=.2)
+}
+
+# Bold the line that crosses between the mean for each normalized error parameter
+mod <- lm(c(0,mean(coefs[,6]/coefs[,2]))~c(mean(coefs[,5]/coefs[,2]),0))
+m<-coef(summary(mod))[2,1]
+yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+  abline(a=yintercept,b=m,col='black',lwd=3)
+
+# Highlight in red the cutoff created by sdtoprune
+mod <- lm(c(0,mean(coefs[,6]/coefs[,2]+sdtoprune*sd(coefs[,6]/coefs[,2])))~c(mean(coefs[,5]/coefs[,2])+sdtoprune*sd(coefs[,5]/coefs[,2]),0))
+m<-coef(summary(mod))[2,1]
+yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+  abline(a=yintercept,b=m,col='red',lwd=3)
+
+  
+keep <- array(dim=c(0,7))
+pruned <- array(dim=c(0,7)) 
+for (i in 1:nrow(coefs)){
+  if ((coefs[i,6]/coefs[i,2]) > (m*coefs[i,5]/coefs[i,2]+yintercept)){
+  pruned<-rbind(pruned,coefs[i,])
+}  else{
+    keep<-rbind(keep,coefs[i,])
+  
+  }
+}
+
+
+par(mfrow=c(2,2), mar=c(3,3,1,1), mgp=c(1.5,.2,0), tck=-.015)
+plotCI(keep[,2], keep[,3], uiw=keep[,5], xlim=c(0,cellSizeRange[2]), gap=0, sfrac=0, pch=16,
+	xlab='Buoyant mass (pg)', ylab='Mass accumulation rate (pg/hr)',col='blue')
+plotCI(pruned[,2],pruned[,3],uiw=pruned[,5],gap=0, sfrac=0, pch=16,col='red',add=TRUE)
+abline(lm(keep[,3]~keep[,2]), col='black')
+abline(h=0, col='grey', lty=2)
+legend('topright', c(paste('(+) n=',sum(keep[,3]>0)),paste('(+) n=',sum(pruned[,3]>0))),text.col=c('blue','red'))
+legend('bottomright', c(paste('(-) n=', sum(keep[,3]<0)),paste('(-) n=',sum(pruned[,3]<0))),text.col=c('blue','red'))
+
+plotCI(keep[,1], keep[,3], uiw=keep[,5], gap=0, sfrac=0,
+  xlab='Time (hours)', ylab='Mass accumulation rate (pg/hr)',col='blue')
+plotCI(pruned[,1], pruned[,3], uiw=pruned[,5], gap=0, sfrac=0,col='red',add=TRUE)
+abline(h=0, col='grey', lty=2)
+
+plotCI(keep[,2], keep[,3]/keep[,2], uiw=keep[,5]/keep[,2], gap=0, sfrac=0,
+  xlab='Buoyant mass (pg)', ylab='MAR per mass (/hr)', xlim=c(0,cellSizeRange[2]) ,col='blue')
+plotCI(pruned[,2], pruned[,3]/pruned[,2], uiw=pruned[,5]/pruned[,2], gap=0, sfrac=0, col='red',add=TRUE)
+abline(h=0, col='grey', lty=2)
+
+plotCI(keep[,1], keep[,3]/keep[,2], uiw=keep[,5]/keep[,2], gap=0, sfrac=0,
+  xlab='Time (hours)', ylab='MAR per mass (/hr)' ,col='blue')
+plotCI(pruned[,1], pruned[,3]/pruned[,2], uiw=pruned[,5]/pruned[,2], gap=0, sfrac=0,col='red',add=TRUE)
+abline(h=0, col='grey', lty=2)
+@
+
+<<tables2, echo=FALSE,results='asis',warning=FALSE>>=
+# Reads settings tables
+
+poscoefs<-subset(keep,keep[,3]>0)
+negcoefs<-subset(keep,keep[,3]<0)
+poscoefs<-cbind(poscoefs,poscoefs[,3]-poscoefs[,5])
+negcoefs<-cbind(negcoefs,negcoefs[,3]+negcoefs[,5])
+Number_within_Zero<-rbind(subset(poscoefs,poscoefs[,8]<0),subset(negcoefs,negcoefs[,8]>0))
+
+Mean_Mass<-mean(keep[,2])
+Mean_MAR<-mean(keep[,3])
+Mean_MAR_Error<-mean(keep[,5])
+Mean_MAR_per_mass<-mean(keep[,3]/keep[,2])
+Mean_MAR_per_mass_error<-mean(keep[,5]/keep[,2])
+NumTotalCells<-nrow(keep)
+NumConfidentPosCells<-nrow(subset(poscoefs,poscoefs[,8]>0))
+NumConfidentNegCells<-nrow(subset(negcoefs,negcoefs[,8]<0))
+Number_within_Error_of_Zero<-nrow(Number_within_Zero)
+
+output<-rbind(sdtoprune,
+                  Mean_Mass,
+                  Mean_MAR,
+                  Mean_MAR_Error,
+                  Mean_MAR_per_mass,
+                  Mean_MAR_per_mass_error,
+                  NumTotalCells,
+                  NumConfidentPosCells,
+                  NumConfidentNegCells,
+                  Number_within_Error_of_Zero)
+
+xtable(data.frame(output),digits=c(4),caption= paste("Removed outliers with gr.se and residual errors ",sdtoprune,"standard deviations above the mean"))
+@
+
+\newpage
+
+<<removedcells,echo=FALSE,results='asis',fig=TRUE>>=
+# par(mfrow=c(5,4), mar=c(1,1,0,0), tck=.01, mgp=c(1,0,0))
+# mod <- lm(c(0,mean(coefs[,6]/coefs[,2]+sdtoprune*sd(coefs[,6]/coefs[,2])))~c(mean(coefs[,5]/coefs[,2])+sdtoprune*sd(coefs[,5]/coefs[,2]),0))
+# mslope<-coef(summary(mod))[2,1]
+# 
+# j=1
+# nPlotted=0
+# for(i in cellList){
+#   if (i$nSensorsUsed < trapLengthCutoff) next
+#   m = i$mass
+#   t= i$time-mean(i$time, na.rm=T)
+#   mod=lm(m~t)
+#   if (((sum(residuals(mod)^2)/length(residuals(mod))/coef(summary(mod))[1,1]) > (mslope*(coef(summary(mod))[2,2]/coef(summary(mod))[1,1])+yintercept))) {
+#     plot(i,pad.x=.5,pad.y=.5)
+#     for (k in length(files):1){
+#       p = detectedPeaks[[k]]
+#       #points(p$time, p$mass, pch=1, col=cols[k])
+#       text(p$time,p$mass, k, cex=.8, col=cols[k])
+#           }
+#     points(i,cex=1.3, col=cols, bg=rep('black',length(cols)),pch=21)
+#     nPlotted=nPlotted+1
+#     plot(x=(coef(summary(mod))[2,2]/coef(summary(mod))[1,1]),y=((sum(residuals(mod)^2)/length(residuals(mod))/coef(summary(mod))[1,1])),
+#          xlim=c(0,max(coefs[,5]/coefs[,2])),ylim=c(0,max(coefs[,6]/coefs[,2])),xlab='Mass Normalized gr.se', ylab='Mass Normalized Mean squared residual',
+#          pch=16,cex=2,col='blue')
+#     main = "Cells pruned for poor matching"
+#     for (i in 0:(sdtoprune+2)){
+#       mod <- lm(c(0,mean(coefs[,6]/coefs[,2]+i*sd(coefs[,6]/coefs[,2])))~c(mean(coefs[,5]/coefs[,2])+i*sd(coefs[,5]/coefs[,2]),0))
+#       m<-coef(summary(mod))[2,1]
+#       #Y intercept
+#       yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+#       abline(a=yintercept,b=m)
+#       legend(x=0,y=yintercept,legend=paste(i,'SD'),bty="n",xjust=.2)
+#     }
+#     
+#     # Bold the line that crosses between the mean for each normalized error parameter
+#     mod <- lm(c(0,mean(coefs[,6]/coefs[,2]))~c(mean(coefs[,5]/coefs[,2]),0))
+#     m<-coef(summary(mod))[2,1]
+#     yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+#     abline(a=yintercept,b=m,col='black',lwd=3)
+#     
+#     # Highlight in red the cutoff created by sdtoprune
+#     mod <- lm(c(0,mean(coefs[,6]/coefs[,2]+sdtoprune*sd(coefs[,6]/coefs[,2])))~c(mean(coefs[,5]/coefs[,2])+sdtoprune*sd(coefs[,5]/coefs[,2]),0))
+#     m<-coef(summary(mod))[2,1]
+#     yintercept <- coef(summary(mod))[1,1]+mean(coefs[,6]/coefs[,2])
+#     abline(a=yintercept,b=m,col='red',lwd=3)
+#       }
+#     j=j+1
+#     }
+
+@
+
+<<beadNoiseEstimates,echo=FALSE,fig=TRUE, results='asis',eval=TRUE>>=
+# mb = 4/3*pi*(calibrationBeadDiameter/2*1e-4)^3* (1.05-mediaDensity) *1e12   # pg /bead
+# mads = sapply(detectedPeaks, 
+#               function(x) mad(x$mass[x$mass %within% (mb*range(calibrationBounds)/mean(calibrationBounds))]))
+# sds =  sapply(detectedPeaks, 
+#               function(x) sd(x$mass[x$mass %within% (mb*range(calibrationBounds)/mean(calibrationBounds))]))
+# xtable(data.frame(sensor=1:length(files),MAD=mads,StDev=sds))
+# 
+# experimentTotalTime = length(dat.bp.decimated[[1]])*plotDec/dataRate/3600 
+# layout(matrix(c(1,2,1,3),nrow=2))
+# par( mar=c(4,4,1,1), tck=-.015,mgp=c(2,.7,0))
+# 
+# 
+# 
+# # first initialize the list to include all beads in the first cantilever
+# beadSizeRange = (mb*range(calibrationBounds)/mean(calibrationBounds))
+# firstSensor=1; secondSensor=2;
+# if (length(sensorsToDrop)>0){
+#   firstSensor = (1:length(files))[-sensorsToDrop][1]
+#   secondSensor = (1:length(files))[-sensorsToDrop][2]
+# }
+# beadList = detectedPeaksToCellList(detectedPeaks[[firstSensor]],firstSensor,beadSizeRange)
+# 
+# 
+# for (i in secondSensor:length(files)){
+# if (i %in% sensorsToDrop) next
+#   
+# 	#initialize every peak in sensor i as its own bead
+# 	newBeadList = detectedPeaksToCellList(detectedPeaks[[i]],i,beadSizeRange)
+# 
+#       # now we're going to match up newCellList with beadList
+#   	costs = peakMatchingCostMatrix(beadList, newBeadList, mass.sd, gr.sd.prior, gr.mu.prior, timeGap.mu, timeGap.sd, gapCost)
+#     costs=costs-min(costs)
+#   	solution = solve_LSAP(costs)
+# 	
+# 	# for every bead in the beadList, update it if we matched it
+# 	for (j in 1:length(beadList)){
+# 		if (solution[j] <= length(newBeadList)) {# then we've matched it.
+# 			beadList[[j]] = joinCells(beadList[[j]], newBeadList[[solution[j]]])
+# 		}  # otherwise, do nothing (unmatched beads stay in the beadList) 
+# 	}
+# 
+# 	# for every bead in the newBeadList, if we didn't match it, add it to beadList
+# 	for (j in (length(beadList)+1):nrow(costs)){ # check every gap in "from" sensor
+# 		if (solution[j] <= length(newBeadList))
+# 			beadList[[length(beadList)+1]] = newBeadList[[ solution[j] ]]		
+# 	}
+# }
+# 
+# detectedBeads=lapply(detectedPeaks, function(x) x[x$mass %within% beadSizeRange,])
+# 
+# plot(-1,-1,xlim=c(0,experimentTotalTime),ylim=c(0,length(files)+3),xlab='time (h)', ylab='sensor')
+# for(i in 1:length(files))   abline(h=i,col='grey',lty=2)
+# i=1
+# for (bead in beadList){
+#   points(bead$time[!is.na(bead$time)], (1:length(files))[!is.na(bead$time)], pch=16, type='o')
+#   text(min(bead$time,na.rm=T), which.min(bead$time)-.6, i,cex=.6)
+#   i=i+1
+# }
+# for (i in 1:length(files)){
+#   d=detectedBeads[[i]]
+#   points(d$time, rep(i,nrow(d)), col=rgb(rank(d$mass)/nrow(d),0,1-rank(d$mass)/nrow(d)),pch=16)
+# }
+# beadsRMSE = round(sapply(beadList, function(x) sd(x$mass,na.rm=T)),3)
+# text(sapply(beadList, function(x) x$lastTime), rep(length(files)+1, length(beadList)), 
+#      beadsRMSE,srt=90,adj=0,cex=.5)
+# 
+# 
+# longTrappedBeadRMSE = beadsRMSE[sapply(beadList, function(x)x$nSensorsUsed >= trapLengthCutoff)]
+# hist(longTrappedBeadRMSE,breaks=30, xlab='bead RMS noise over all sensors', main='bead RMS noise', ylab='count');
+# abline(v=median(longTrappedBeadRMSE),col='red')
+# 
+# 
+# for (i in length(files):1){
+#   p = detectedPeaks[[i]]
+#   p = p[p$mass %within% (mb*range(calibrationBounds)/mean(calibrationBounds)),]
+#   if(i==length(files))
+#     plot(p$time, p$mass, pch=16,  ylim=mb*range(calibrationBounds)/mean(calibrationBounds), col=cols[i], 
+#          xlab='time (h)', ylab='buoyant mass (pg)', xlim=c(0,experimentTotalTime))
+#   if (i!=length(files))
+#     points(p$time, p$mass, pch=16, col=cols[i])
+# }
+
+@
+
+
+<<PullFiles,echo=FALSE, message=FALSE,warning=FALSE,eval=TRUE>>==
+wellFile<-file.path(directory,"well_positions.bin",fsep= .Platform$file.sep)
+wellpositions<-readBin(wellFile, n=5e7, what='integer', endian='big')
+
+if(length(wellpositions)%%5==0){
+  metadata<-matrix(wellpositions,ncol=5,byrow=TRUE)
+  metadata<-cbind(metadata[,1]-min(metadata[,1]),metadata[,1],metadata[,2:4])
+
+}else{
+ wellpositions<-readBin(wellFile, n=5e7, what='double', endian='big')
+ metadata<-matrix(wellpositions,ncol=4,byrow=TRUE)
+ metadata<-cbind(metadata[,1]-min(metadata[,1]),metadata[,1],metadata[,3:4],metadata[,2])
+ colnames(metadata)<-c("rel time","abs time","row","column","sample")
+
+  }
+
+
+
+#Read in outgrowth data and translate, -1 means cell died, 1 means cell proliferated, 0 means nothing happened, -2 means no cell found in that well
+
+if (is.na(outgrowthfile)==FALSE){
+outgrowth<-read.xlsx(outgrowthfile,1,header=FALSE)
+outgrowth[which(outgrowth>0,arr.ind=TRUE)]<-1
+outgrowth[which(outgrowth<0,arr.ind=TRUE)]<--1
+outgrowth[is.na(outgrowth)]<--2
+} else {
+  outgrowth<-matrix(0,nrow=8,ncol=12)
+}
+
+
+@
+
+
+<<Setup2,echo=FALSE, message=FALSE,warning=FALSE,eval=TRUE>>==
+imageLocation <- 1
+plotmargin <- c(25,40)
+freqsubsample<-5
+flushtime<-10
+preceedingBuffer<-2
+
+#compute frequency change of last cantilever
+#last.dat<-last.dat
+letters<-c('A','B','C','D','E','F','G','H')
+
+@
+
+<<FrequencyPlot,echo=FALSE, message=FALSE,warning=FALSE,eval=TRUE>>==
+par(mfrow=c(1,1),mar=c(2,2,2,0), tck=.01, mgp=c(1,0,0))
+singletFiles<-array()
+#Pull image files, image times and convert image times to decimal hours then offset to experiment start
+if (!is.null(imageDirectory)){
+  textFiles <- unlist(list.files(imageDirectory,pattern=".txt"))
+  for (i in 1:length(textFiles)){
+    if (substr(textFiles[i],nchar(textFiles[i])-7,nchar(textFiles[i])-4)=="1000")
+    singletFiles[i]<-paste(substr(textFiles[i],1,nchar(textFiles[i])-9),".jpg",sep="")
+  }
+  singletFiles<-singletFiles[!is.na(singletFiles)]
+  imageFiles = singletFiles
+  imageFilesFullPath = paste(imageDirectory, imageFiles,sep="")
+  imageTimes <-file_path_sans_ext(imageFiles)
+  imageTimes <- (as.numeric(substr(imageTimes,1,2))*3600+as.numeric(substr(imageTimes,3,4))*60+as.numeric(substr(imageTimes,5,10)))/3600
+  imageTimes[is.na(imageTimes)]<- 99
+  imageTimes = imageTimes-min(metadata[,2]/3600)
+  }
+  
+
+#Find when the motors moved by looking for sample # mismatch
+indexes<-array()
+for (i in 2:(nrow(metadata))){
+  if (metadata[i,5]!=metadata[i-1,5]){
+       indexes<-c(indexes,i)
+           }
+      }
+indexes<-indexes[-1]
+
+#crosscheck the indexes array to make sure all indexes occured in row 2/B
+#indexes<-indexes[metadata[indexes,3]==2]
+
+#Compute an estimated last cantilever time for all cells, if last sensor used = # of sensors then the value =0 and actual las titme is used
+ for (j in 1:length(cellList)){
+   i<-cellList[[j]]
+   i$correctedLastTime<-i$lastTime+(length(o)-i$lastSensorUsed)*(mean(diff(i$time[i$sensorsUsed])/diff(i$sensorsUsed)))
+   cellList[[j]]<-i
+ }
+
+#Image matching to cellList cells
+ for (j in 1:length(cellList)){
+       cellList[[j]]$picture <- NULL
+       cellList[[j]]$picTime <- 'not matched'
+       cellList[[j]]$matchedToWell <- FALSE
+       cellList[[j]]$row <- NA
+       cellList[[j]]$col <- NA
+       cellList[[j]]$num <- NA
+       cellList[[j]]$nInWell <- NA
+       cellList[[j]]$sample <- NA
+       cellList[[j]]$outgrowth<- -2
+       cellList[[j]]$numPeaksinWindow <- NA
+     if ((imageLocation %in% cellList[[j]]$sensorsUsed)&matchimages&length(subset(imageTimes,imageTimes<cellList[[j]]$time[1])-cellList[[j]]$time[1])!=0){
+         cellList[[j]]$picture<-load.image(imageFilesFullPath[which.min(abs(subset(imageTimes,imageTimes<cellList[[j]]$time[1])-cellList[[j]]$time[1]))])
+         cellList[[j]]$picTime<-round(imageTimes[which.min(abs(subset(imageTimes,imageTimes<cellList[[j]]$time[1])-cellList[[j]]$time[1]))],digits=4)
+         }
+ }
+
+#Make a list of the last cantilever times
+lastCantTimes<- array()
+for (i in cellList){
+  lastCantTimes<-c(lastCantTimes,i$correctedLastTime)
+}
+lastCantTimes<-lastCantTimes[-1]
+lastCantTimes[is.nan(lastCantTimes)]<-99
+
+
+#Match and plot matched events
+
+layout(matrix(c(1,2,1,3),nrow=2))
+par( mar=c(4,4,1,1), tck=-.015,mgp=c(2,.7,0))
+
+for (i in 1:(length(indexes))){
+  collectionWindow<-c((indexes[i]*128)/(3600*dataRate)-preceedingBuffer/3600,(indexes[i]*128)/(3600*dataRate)+flushtime/3600)
+  cellsCollected<-subset(lastCantTimes,lastCantTimes>collectionWindow[1]&lastCantTimes<collectionWindow[2])
+  numDetectedPeaks <- length(cellsCollected)
+  if(length(cellsCollected)==0){
+    numDetectedPeaks <- 0
+    cellsCollected<-(indexes[i]*128)/(3600*dataRate)
+  }
+  plotrange<-(indexes[i]*128-dataRate*plotmargin[1]):(indexes[i]*128+dataRate*plotmargin[2])
+  plot(plotrange/(3600*dataRate),last.dat[plotrange]-mean(last.dat[plotrange]),type='l',bty='n',col=cols[length(o)],ylab='Frequency (Hz)',xlab="Time (Hr)",main=paste("s: ",metadata[indexes[i],5],", r:",letters[metadata[indexes[i],3]],", c:",metadata[indexes[i],4], ", num=",i,", # in well=",length(cellsCollected)))
+  
+  abline(v=(indexes[i]*128)/(3600*dataRate),lty=2,lwd=3,col='black')
+  abline(v=(indexes[i+1]*128)/(3600*dataRate),lty=2,lwd=2,col='gold')
+  abline(v=(indexes[i]*128)/(3600*dataRate)+flushtime/3600,lty=2,lwd=2,col='green')
+  abline(v=(indexes[i]*128)/(3600*dataRate)-preceedingBuffer/3600,lty=2,lwd=2,col='gray')
+  
+  points(detectedPeaks[[length(o)]]$time,-1*detectedPeaks[[length(o)]]$mass*sensitivities[length(o)],pch=16,cex=2)
+  text(detectedPeaks[[length(o)]]$time,-1*detectedPeaks[[length(o)]]$mass*sensitivities[length(o)],labels=round(detectedPeaks[[length(o)]]$mass,1),-1)
+  
+  q<-which.min(abs(cellsCollected[which.min(cellsCollected-indexes[i]*128/(3600*dataRate))]-lastCantTimes))
+  
+  plot(cellList[[q]],xlab='time (hr)', ylab='buoyant mass (pg)')
+  abline(v=(indexes[i]*128)/(3600*dataRate),lty=2,lwd=3,col='black')
+  abline(v=(indexes[i+1]*128)/(3600*dataRate),lty=2,lwd=2,col='gold')
+  abline(h=cellList[[q]]$mass[max(cellList[[q]]$sensorsUsed,na.rm=TRUE)],lty=2,col='black',lwd=1.5)
+
+for (j in cellsCollected){
+  q<-which.min(abs(j-lastCantTimes))
+  cellList[[q]]$row<-metadata[indexes[i],3]
+  cellList[[q]]$col<-metadata[indexes[i],4]
+  cellList[[q]]$sample<-metadata[indexes[i],5]
+  cellList[[q]]$num<-i
+  cellList[[q]]$nInWell<-length(cellsCollected)
+  cellList[[q]]$matchedToWell<-TRUE
+  cellList[[q]]$numPeaksinWindow <- numDetectedPeaks
+}
+  
+  if (is.numeric(cellList[[q]]$picTime)){
+    abline(v=cellList[[q]]$picTime,lwd=2,lty=2,col='blue')
+    plot(cellList[[q]]$picture,main=paste("T=",cellList[[q]]$picTime,"(Hrs)"),axes=FALSE)
+    } else {
+    plot(cellList[[q]],xlab='time (hr)', ylab='buoyant mass (pg)',main="Not matched to pic")
+  abline(v=(indexes[i]*128)/(3600*dataRate),lty=2,lwd=3,col='black')
+  abline(v=(indexes[i+1]*128)/(3600*dataRate),lty=2,lwd=2,col='gold')
+  }
+}
+
+
+#plot unmatched cells
+par(mfrow=c(2,2),mar=c(2,2,2,0), tck=.01, mgp=c(1,0,0))
+for (i in 1:length(cellList)){
+  if (cellList[[i]]$matchedToWell == FALSE){
+    plot(cellList[[i]],xlab='time (hr)', ylab='buoyant mass (pg)',main="Not matched to well")
+    abline(v=cellList[[i]]$picTime,lwd=2,lty=2,col='blue')
+      if (is.numeric(cellList[[i]]$picTime)){
+  plot(cellList[[i]]$picture, main=paste("T=",cellList[[i]]$picTime,"(Hrs),","delta=",(cellList[[i]]$time[1]-cellList[[i]]$picTime)*3600,"s"),axes=FALSE)
+    } else{
+    plot(cellList[[i]],xlab='time (hr)', ylab='buoyant mass (pg)',main="No image")
+    abline(v=cellList[[i]]$picTime,lwd=2,lty=2,col='blue')    
+    }
+  }
+}
+
+
+<<individualTrajectories2, echo=FALSE,fig=TRUE,fig.height=12,fig.width=10,out.width="1\\linewidth",eval=FALSE>>=
+par(mfrow=c(9,5), mar=c(1,1,0,0), tck=.01, mgp=c(1,0,0))
+coefsAll = array(dim=c(0,14))
+j=1
+nPlotted=0
+for(i in cellList){
+  m = i$mass
+	t= i$time-mean(i$time, na.rm=T)
+  mod=lm(m~t)
+  if (i$nSensorsUsed<=2){
+  coefsAll = rbind(coefsAll, c(i$avgTime,i$avgMass,NA,NA,NA,NA,i$nSensorsUsed,NA,i$sample,i$row,i$col,i$num,i$nInWell,i$numPeaksinWindow))
+  } else{
+  coefsAll = rbind(coefsAll, c(i$avgTime,coef(summary(mod))[1:2,1:2],sum((residuals(mod))^2)/length(residuals(mod)),i$nSensorsUsed,i$correctedLastTime,i$sample,i$row,i$col,i$num,i$nInWell,i$numPeaksinWindow))
+  }
+  j=j+1
+}
+colnames(coefsAll) = c('avgTime', 'avgMass','gr','avgMass.se','gr.se','av.sqrd.gr.residual','# cant','last cant Time','sample #','row','column','tube #','# in well', 'numPeaksinWindow')
+@
+
+<<massVsOutGrowthRate, echo=FALSE,fig=TRUE,eval=FALSE>>=
+# coefs2<-subset(coefs,coefs[,10]>-2)
+# outgrowthcols<-c('red','gold','green')
+# 
+# par(mfrow=c(2,2), mar=c(3,3,1,1), mgp=c(1.5,.2,0), tck=-.015)
+# plotCI(coefs[,2], coefs[,3], uiw=coefs[,5], xlim=c(0,cellSizeRange[2]), gap=0, sfrac=0, pch=16,
+# 	xlab='Buoyant mass (pg)', ylab='Mass accumulation rate (pg/hr)')
+# abline(lm(coefs[,3]~coefs[,2]), col='red')
+# abline(h=0, col='grey', lty=2)
+# legend('topright', paste('(+) n=',sum(coefs[,3]>0)))
+# legend('bottomright', paste('(-) n=', sum(coefs[,3]<0)))
+# points(coefs2[,2],coefs2[,3],cex=1.25,col=outgrowthcols[coefs2[,10]+2],pch=16)
+# 
+# plotCI(coefs[,1], coefs[,3], uiw=coefs[,5], gap=0, sfrac=0,
+#   xlab='Time (hours)', ylab='Mass accumulation rate (pg/hr)')
+# abline(h=0, col='grey', lty=2)
+# points(coefs2[,1],coefs2[,3],cex=1.25,col=outgrowthcols[coefs2[,10]+2],pch=16)
+# 
+# plotCI(coefs[,2], coefs[,3]/coefs[,2], uiw=coefs[,5]/coefs[,2], gap=0, sfrac=0,
+#   xlab='Buoyant mass (pg)', ylab='MAR per mass (/hr)', xlim=c(0,cellSizeRange[2]) )
+# abline(h=0, col='grey', lty=2)
+# points(coefs2[,2],coefs2[,3]/coefs2[,2],cex=1.25,col=outgrowthcols[coefs2[,10]+2],pch=16)
+# 
+# plotCI(coefs[,1], coefs[,3]/coefs[,2], uiw=coefs[,5]/coefs[,2], gap=0, sfrac=0,
+#   xlab='Time (hours)', ylab='MAR per mass (/hr)' )
+# abline(h=0, col='grey', lty=2)
+# points(coefs2[,1],coefs2[,3]/coefs2[,2],cex=1.25,col=outgrowthcols[coefs2[,10]+2],pch=16)
+@
+
+
+<<Heuristics, echo=FALSE,fig=TRUE,eval=TRUE>>=
+# dbp<-list()
+# beadActualSD<-rep(0,length(o))
+# for (i in 1:length(o)){
+#   dbp[[i]]<-subset(detectedPeaks[[i]],detectedPeaks[[i]]$mass<calibrationBounds[2]&detectedPeaks[[i]]$mass>calibrationBounds[1])
+# beadActualSD[i]<-sd(dbp[[i]]$mass)
+# }
+# plot(density(dbp[[1]]$mass,bw=densityBandwidth),col=cols[1],lwd=2,type='l',main="Bead Mass distribution",cex.lab=2,xlab="Buoyant Mass (pg)",ylab="Kernel Density",ylim=c(0,3.4))
+# for (i in 2:length(o)){
+#   points(density(dbp[[i]]$mass,bw=densityBandwidth),col=cols[i],lwd=2, type='l')
+# }
+# points(density(coefs2[,2],bw=densityBandwidth),col='black',lwd=5,lty=2, type='l')
+# 
+# beadMassVariance<-c(pi*4/3*(calibrationBeadDiameter/2*(1-calibrationBeadCV)*10^-4)^3,pi*4/3*(calibrationBeadDiameter/2*(1+calibrationBeadCV)*10^-4)^3)
+# beadMassVariance<-beadMassVariance*(1.05-mediaDensity)*10^12
+# beadMassMode<-pi*4/3*(calibrationBeadDiameter/2*10^-4)^3*(1.05-mediaDensity)*10^12
+# points(seq(from=calibrationBounds[1],to=calibrationBounds[2],by=0.05),dnorm(seq(from=calibrationBounds[1],to=calibrationBounds[2],by=0.05),mean=beadMassMode,sd=mean(abs(beadMassVariance-beadMassMode))),pch=16,cex=2)
+# 
+# instrumentNoise<-sensitivities*as.numeric(SMRSettingsTrim[,8])
+# abline(v=beadMassMode-2*mean(instrumentNoise)/2,lty=3,lwd=2)
+# abline(v=beadMassMode+2*mean(instrumentNoise)/2,lty=3,lwd=2)
+# abline(v=beadMassMode,lty=2,lwd=2)
+# 
+# coefs2<-subset(coefs,coefs[,2]<calibrationBounds[2]&coefs[,2]>calibrationBounds[1])
+# coefs2<-subset(coefs2,coefs2[,7]>10)
+# plot(density(coefs2[,3],bw=0.05),ylab="Density Kernel",xlab="pg/hr",cex.lab=2,main="7um bead 'growth rates'",ylim=c(0,1.4),lwd=2)
+# points(seq(from=-1,to=1,by=0.01),dnorm(seq(from=-1,to=1,by=0.01),mean=0,sd=.2)/1.5,pch=16,cex=1.25)
+
+@
+
+<<saveData, echo=FALSE, fig=FALSE,eval=TRUE>>=
+#times, masses, cells,coefs, detectedPeaks
+save(list=c("cellList","coefs","coefsAll","detectedPeaks",'carriers','sensitivities'), file=sampleName%+%"_processed.RData")
+write.csv(coefs,paste(directory,sampleName,'coefs','.csv',sep=""))
+write.csv(keep,paste(directory,sampleName,'keep','.csv',sep=""))
+write.csv(coefsAll,paste(directory,sampleName,'coefsAll','.csv',sep=""))
+#for combined analysis
+coefs_2 <- as.data.frame(coefsAll)
+coefs_2$mouse_id <- rep(mouse_id, nrow(coefs_2))
+coefs_2$treatment_id <- rep(treatment_id, nrow(coefs_2))
+write.csv(coefs_2, paste0(directory, mouse_id,treatment_id,"coefsAll_2.csv"))
+@
+
+
+\end{document}
